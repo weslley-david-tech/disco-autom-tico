@@ -19,30 +19,56 @@ def normalizar_telefone(valor):
         return None
     return "+" + numero
 
-def ler_planilha(arquivo):
-    planilhas = pd.read_excel(arquivo, sheet_name=None, header=0)
+def encontrar_dados(arquivo_bytes):
+    xls = pd.ExcelFile(io.BytesIO(arquivo_bytes))
     candidatos = []
 
-    for nome, df in planilhas.items():
-        df = df.dropna(how="all").dropna(axis=1, how="all")
-        if not df.empty:
-            candidatos.append((nome, df))
+    for aba in xls.sheet_names:
+        bruto = pd.read_excel(
+            io.BytesIO(arquivo_bytes),
+            sheet_name=aba,
+            header=None,
+            dtype=str
+        )
 
-    if not candidatos:
-        raise ValueError("Não encontrei nenhuma linha com dados no arquivo.")
+        bruto = bruto.dropna(how="all").dropna(axis=1, how="all")
+
+        if bruto.empty:
+            continue
+
+        melhor = None
+
+        for inicio in range(min(len(bruto), 20)):
+            bloco = bruto.iloc[inicio:].copy()
+            bloco = bloco.dropna(how="all")
+
+            if len(bloco.columns) >= 2 and len(bloco) >= 2:
+                linhas_com_dados = bloco.iloc[:, 0].notna().sum()
+                if linhas_com_dados > 0:
+                    score = len(bloco)
+                    if melhor is None or score > melhor[0]:
+                        melhor = (score, inicio, bloco)
+
+        if melhor:
+            candidatos.append((aba, melhor[1], melhor[2]))
 
     return candidatos
 
-def preparar_dados(df):
-    if len(df.columns) < 2:
-        raise ValueError("A planilha selecionada precisa ter pelo menos duas colunas.")
+def preparar_dados(bruto, inicio):
+    dados = bruto.iloc[inicio:].copy()
 
-    dados = df.iloc[:, :2].copy()
+    if dados.empty or len(dados.columns) < 2:
+        raise ValueError("Não foi possível localizar as duas primeiras colunas da planilha.")
+
+    dados = dados.iloc[:, :2].copy()
     dados.columns = ["Telefone", "Mensagem"]
-    dados = dados.dropna(how="all")
 
-    dados["Telefone"] = dados["Telefone"].astype(str).str.strip()
+    dados["Telefone"] = dados["Telefone"].fillna("").astype(str).str.strip()
     dados["Mensagem"] = dados["Mensagem"].fillna("").astype(str).str.strip()
+
+    primeira = dados.iloc[0]["Telefone"].lower()
+    if "telefone" in primeira or "celular" in primeira or "numero" in primeira or "número" in primeira:
+        dados = dados.iloc[1:].copy()
 
     dados = dados[
         (dados["Telefone"] != "") &
@@ -50,35 +76,30 @@ def preparar_dados(df):
     ].copy()
 
     if dados.empty:
-        raise ValueError("Não encontrei telefones válidos para processar.")
+        raise ValueError("Encontrei a planilha, mas não localizei telefones com dados.")
 
     dados["Telefone_Normalizado"] = dados["Telefone"].apply(normalizar_telefone)
     dados["Status"] = dados["Telefone_Normalizado"].apply(
         lambda x: "Aguardando" if x else "Número inválido"
     )
     dados["Detalhe"] = dados["Telefone_Normalizado"].apply(
-        lambda x: "Pronto para processamento" if x else "Telefone não reconhecido"
+        lambda x: "Pronto para processamento" if x else "Formato de telefone inválido"
     )
 
-    return dados
+    return dados.reset_index(drop=True)
 
 def executar_simulacao(df, progresso, status_texto, tabela):
     resultados = df.copy()
     validos = resultados.index[resultados["Status"] == "Aguardando"].tolist()
 
     if not validos:
-        status_texto.warning("Não há números válidos para processar.")
+        status_texto.warning("Não existem números válidos para processar.")
         return resultados
 
     for posicao, indice in enumerate(validos, start=1):
         telefone = resultados.at[indice, "Telefone_Normalizado"]
-        mensagem = resultados.at[indice, "Mensagem"]
-
-        status_texto.info(
-            f"📞 Processando {posicao} de {len(validos)}: {telefone}"
-        )
-
-        time.sleep(0.5)
+        status_texto.info(f"📞 Processando {posicao} de {len(validos)}: {telefone}")
+        time.sleep(0.35)
 
         resultado = random.choices(
             ["Sucesso", "Não atendeu", "Ocupado", "Falha"],
@@ -87,18 +108,19 @@ def executar_simulacao(df, progresso, status_texto, tabela):
         )[0]
 
         detalhes = {
-            "Sucesso": f"Contato atendido. Mensagem processada: {mensagem[:60]}",
-            "Não atendeu": "Chamada sem atendimento",
+            "Sucesso": "Contato atendido e mensagem processada",
+            "Não atendeu": "Tentativa sem atendimento",
             "Ocupado": "Linha ocupada",
-            "Falha": "Falha na tentativa de chamada"
+            "Falha": "Falha na tentativa"
         }
 
         resultados.at[indice, "Status"] = resultado
         resultados.at[indice, "Detalhe"] = detalhes[resultado]
+
         progresso.progress(posicao / len(validos))
         tabela.dataframe(resultados, use_container_width=True, hide_index=True)
 
-    status_texto.success("Campanha simulada concluída!")
+    status_texto.success("Campanha concluída!")
     return resultados
 
 def gerar_excel(df):
@@ -109,37 +131,49 @@ def gerar_excel(df):
     return buffer
 
 st.title("📞 Discador Automático")
-st.caption("Versão MVP • Importação de Excel • Validação • Simulação de contatos")
+st.caption("Importe sua planilha, valide os contatos e acompanhe a campanha")
 
-arquivo = st.file_uploader(
-    "Carregue sua planilha Excel",
-    type=["xlsx", "xls"]
-)
+arquivo = st.file_uploader("Carregue sua planilha Excel", type=["xlsx", "xls"])
 
 if arquivo:
     try:
+        arquivo_bytes = arquivo.getvalue()
+
         if st.session_state.get("arquivo_nome") != arquivo.name:
-            planilhas = ler_planilha(arquivo)
-            st.session_state.planilhas = planilhas
+            candidatos = encontrar_dados(arquivo_bytes)
+
+            if not candidatos:
+                raise ValueError("Não encontrei nenhuma aba com dados. Verifique se o arquivo possui uma planilha preenchida.")
+
+            st.session_state.candidatos = candidatos
             st.session_state.arquivo_nome = arquivo.name
             st.session_state.processado = False
+            st.session_state.dados = None
 
-        nomes = [nome for nome, _ in st.session_state.planilhas]
+        nomes = [
+            f"{aba} • dados encontrados"
+            for aba, _, _ in st.session_state.candidatos
+        ]
 
-        nome_planilha = st.selectbox(
-            "Selecione a aba da planilha que contém os telefones",
-            nomes
+        escolha = st.selectbox(
+            "Selecione a aba que contém os contatos",
+            range(len(nomes)),
+            format_func=lambda i: nomes[i]
         )
 
-        df_original = dict(st.session_state.planilhas)[nome_planilha]
-        df = preparar_dados(df_original)
+        aba, inicio, bruto = st.session_state.candidatos[escolha]
 
-        if "dados" not in st.session_state or st.session_state.get("aba_atual") != nome_planilha:
-            st.session_state.dados = df
-            st.session_state.aba_atual = nome_planilha
+        if (
+            st.session_state.dados is None
+            or st.session_state.get("aba_atual") != aba
+        ):
+            st.session_state.dados = preparar_dados(bruto, 0)
+            st.session_state.aba_atual = aba
             st.session_state.processado = False
 
         dados = st.session_state.dados
+
+        st.success(f"Planilha encontrada: {aba}")
 
         st.subheader("Pré visualização da campanha")
         tabela = st.empty()
@@ -159,15 +193,16 @@ if arquivo:
                 )
                 st.session_state.processado = True
                 st.rerun()
+
         else:
             resultado = st.session_state.dados
-
-            st.subheader("Resultado da campanha")
             resumo = resultado["Status"].value_counts()
 
-            colunas = st.columns(5)
+            st.subheader("Resultado da campanha")
+
+            cols = st.columns(5)
             for coluna, nome in zip(
-                colunas,
+                cols,
                 ["Sucesso", "Não atendeu", "Ocupado", "Falha", "Número inválido"]
             ):
                 coluna.metric(nome, int(resumo.get(nome, 0)))
@@ -175,23 +210,17 @@ if arquivo:
             st.dataframe(resultado, use_container_width=True, hide_index=True)
 
             excel = gerar_excel(resultado)
-            nome_arquivo = (
-                f"resultado_discador_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
 
             st.download_button(
                 "📥 Baixar relatório Excel",
                 data=excel,
-                file_name=nome_arquivo,
+                file_name=f"resultado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
 
     except Exception as erro:
         st.error(f"Erro ao processar a planilha: {erro}")
+
 else:
-    st.info(
-        "A planilha deve conter pelo menos duas colunas: "
-        "Telefone e Mensagem."
-    )
+    st.info("A planilha pode ter títulos em qualquer linha. O sistema tentará localizar os dados automaticamente.")
